@@ -52,14 +52,14 @@ class SiglipVisionEmbeddings(nn.Module):
 
         self.register_buffer("position_ids", torch.arange(self.num_positions).expand((1, -1)), persistent=False)
 
-        def forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
-            _,_,height,width = pixel_values.shape
-            patch_embeds = self.patch_embedding(pixel_values)
-            embeddings = patch_embeds.flatten(2)
-            embeddings = embeddings.transpose(1,2)
-            embeddings = embeddings+self.position_embedding(self.position_ids)
+    def forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
+        _,_,height,width = pixel_values.shape
+        patch_embeds = self.patch_embedding(pixel_values)
+        embeddings = patch_embeds.flatten(2)
+        embeddings = embeddings.transpose(1,2)
+        embeddings = embeddings+self.position_embeddings(self.position_ids)
 
-            return embeddings
+        return embeddings
 
 class SiglipMLP(nn.Module):
     def __init__(self, config):
@@ -94,21 +94,40 @@ class SiglipAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor)->Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # hidden_states: [Batch_size, Num_Patches, Embed_Dim]
         batch_size, seq_len, _ = hidden_states.size()
+        # query_states: [Batch_size, Num_Patches, Embed_Dim]
         query_states = self.q_proj(hidden_states)
+        # [Batch_size, Num_Patches, Embed_Dim]
         key_states = self.k_proj(hidden_states)
+        # [Batch_size, Num_Patches, Embed_Dim]
         value_states = self.v_proj(hidden_states)
 
+        # query_states = [Batch_size, Num_heads, Num_Patches, Head_dim] * [Batch_size, Num_heads, Head_dim, Num_Patches]
+        query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1,2)
+        key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1,2)
+        value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1,2)
 
+        # attention_weights = [Batch_size, Num_heads, Num_Patches, Num_Patches]
+        attention_weights = torch.matmul(query_states, key_states.transpose(2,3))*self.scale
 
+        if attention_weights.size()!= (batch_size, self.num_heads, seq_len, seq_len):
+            raise ValueError(f"Attention weights shape {attention_weights.size()} is not correct")
+
+        attention_weights = nn.functional.softmax(attention_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attention_weights = nn.functional.dropout(attention_weights, p=self.dropout, training=self.training)
+
+        # Multiply the attention weight by value states. attention_output = [Batch_size, Num_heads, Num_Patches, Head_dim]
+        attention_output = torch.matmul(attention_weights, value_states)
+        # [Batch_size, Num_heads, Num_patches, Head_dim] -> [Batch_size, Num_patches, Num_heads, Head_dim]
+        attention_output = attention_output.transpose(1, 2).contiguous()
+
+        attention_output = attention_output.reshape(batch_size, seq_len, self.embed_dim)
+
+        attention_output = self.out_proj(attention_output)
+
+        return attention_output, attention_weights
 
         
-
-
-
-
-
-        
-class SiglipEncoder(nn.Module):
+class SiglipEncoderLayer(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -128,7 +147,23 @@ class SiglipEncoder(nn.Module):
         hidden_states = residual+hidden_states
 
         return hidden_states
-    
+
+class SiglipEncoder(nn.Module):
+    def __init__(self, config: SiglipVisionConfig):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList([
+            SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)
+        ])
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        hidden_states = inputs_embeds
+
+        for encoder_layer in self.layers:
+            hidden_states = encoder_layer(hidden_states)
+
+        return hidden_states
+
 
 class SiglipVisiontransformer(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
@@ -153,6 +188,6 @@ class SiglipVision(nn.Module):
         self.config = config
         self.vision_model = SiglipVisiontransformer(config)
 
-        def forward(self, pixel_values)-> Tuple:
+    def forward(self, pixel_values)-> Tuple:
             """[Batch_size, Num_channels, Image_size, Image_size] -> [Batch_size, Num_patches, Embedding_dim]"""
             return self.vision_model(pixel_values=pixel_values)
